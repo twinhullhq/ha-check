@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ha-check — is your Patroni cluster really healthy? One command, one answer.
+#  https://github.com/twinhullhq/ha-check          MIT License © Twinhull
+#
+#  Usage:
+#    ha-check --patroni http://10.0.0.11:8008 [options]
+#
+#  Point it at ONE Patroni REST API; it discovers the other members itself.
+#
+#  Options:
+#    --patroni URL          Patroni REST API of any member (repeatable, or comma-separated)
+#    --etcd URLS            etcd client URLs, comma-separated (enables the etcd checks)
+#    --etcd-cacert FILE     \
+#    --etcd-cert FILE        > TLS for etcd (mutual TLS)
+#    --etcd-key FILE        /
+#    --patroni-cacert FILE  CA for a Patroni REST API served over https
+#    --patroni-auth U:P     basic auth for the Patroni REST API
+#    --insecure             don't verify TLS certificates (not recommended)
+#    --rw HOST:PORT         read-write endpoint your apps use (HAProxy, VIP, pgbouncer...)
+#    --ro HOST:PORT         read-only endpoint
+#    --pg-user USER         user for the SQL checks (default: $PGUSER or postgres;
+#                           password via ~/.pgpass or $PGPASSWORD)
+#    --stanza NAME          pgBackRest stanza (enables the backup-age check)
+#    --pgbackrest-config F  pgBackRest config file, if not the default
+#    --expect-members N     number of members the cluster should have (default: as registered)
+#    --lag-warn BYTES       replica lag warning threshold    (default 1048576 = 1 MB)
+#    --lag-crit BYTES       replica lag critical threshold   (default 104857600 = 100 MB)
+#    --backup-max-age H     newest backup older than H hours is critical (default 26)
+#    -c, --config FILE      read settings from FILE (KEY=value lines, see README)
+#    --json                 machine-readable output
+#    -q, --quiet            print only problems and the verdict
+#    --no-color             plain output
+#    -V, --version          print version
+#    -h, --help             this help
+#
+#  Checks: etcd quorum and leader agreement · Patroni leader, members, pause,
+#  pending restarts, DCS contact · replication state, lag, timelines, sync
+#  standby · routing of the RW/RO endpoints · WAL archiving · inactive slots ·
+#  backup age.
+#
+#  Exit codes (Nagios / Icinga / Zabbix / Sensu convention):
+#    0 OK   1 WARNING   2 CRITICAL   3 UNKNOWN
+# =============================================================================
+set -uo pipefail
+VERSION=1.0.0
+
+PATRONI_URLS=() ETCD_URLS=""
+ETCD_CACERT="" ETCD_CERT="" ETCD_KEY="" PATRONI_CACERT="" PATRONI_AUTH="" INSECURE=0
+RW="" RO="" PG_USER="${PGUSER:-postgres}" STANZA="" PGBR_CONFIG="" EXPECT=0
+LAG_WARN=1048576 LAG_CRIT=104857600 BACKUP_MAX_AGE_H=26
+JSON=0 QUIET=0 COLOR=1
+
+usage() { sed -n '3,43p' "$0" | sed 's/^# \{0,2\}//'; }
+die()   { echo "UNKNOWN: $*"; exit 3; }
+
+load_config() { # KEY=value lines; keys are the long option names in upper case
+  local f=$1 k v
+  [[ -r "$f" ]] || die "cannot read config file $f"
+  while IFS='=' read -r k v; do
+    k=${k//[[:space:]]/}; [[ -z "$k" || "$k" == \#* ]] && continue
+    v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+    case $k in
+      PATRONI)           IFS=', ' read -r -a _p <<<"$v"; PATRONI_URLS+=("${_p[@]}") ;;
+      ETCD)              ETCD_URLS=$v ;;
+      ETCD_CACERT)       ETCD_CACERT=$v ;;
+      ETCD_CERT)         ETCD_CERT=$v ;;
+      ETCD_KEY)          ETCD_KEY=$v ;;
+      PATRONI_CACERT)    PATRONI_CACERT=$v ;;
+      PATRONI_AUTH)      PATRONI_AUTH=$v ;;
+      INSECURE)          [[ $v == 1 || $v == true ]] && INSECURE=1 ;;
+      RW)                RW=$v ;;
+      RO)                RO=$v ;;
+      PG_USER)           PG_USER=$v ;;
+      STANZA)            STANZA=$v ;;
+      PGBACKREST_CONFIG) PGBR_CONFIG=$v ;;
+      EXPECT_MEMBERS)    EXPECT=$v ;;
+      LAG_WARN)          LAG_WARN=$v ;;
+      LAG_CRIT)          LAG_CRIT=$v ;;
+      BACKUP_MAX_AGE)    BACKUP_MAX_AGE_H=$v ;;
+      *) die "unknown key '$k' in $f" ;;
+    esac
+  done <"$f"
+}
+
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || die "option $1 needs a value"; }
+while (($#)); do
+  case "$1" in
+    --patroni)            need_arg "$@"; IFS=', ' read -r -a _p <<<"$2"; PATRONI_URLS+=("${_p[@]}"); shift ;;
+    --etcd)               need_arg "$@"; ETCD_URLS=$2; shift ;;
+    --etcd-cacert)        need_arg "$@"; ETCD_CACERT=$2; shift ;;
+    --etcd-cert)          need_arg "$@"; ETCD_CERT=$2; shift ;;
+    --etcd-key)           need_arg "$@"; ETCD_KEY=$2; shift ;;
+    --patroni-cacert)     need_arg "$@"; PATRONI_CACERT=$2; shift ;;
+    --patroni-auth)       need_arg "$@"; PATRONI_AUTH=$2; shift ;;
+    --insecure)           INSECURE=1 ;;
+    --rw)                 need_arg "$@"; RW=$2; shift ;;
+    --ro)                 need_arg "$@"; RO=$2; shift ;;
+    --pg-user)            need_arg "$@"; PG_USER=$2; shift ;;
+    --stanza)             need_arg "$@"; STANZA=$2; shift ;;
+    --pgbackrest-config)  need_arg "$@"; PGBR_CONFIG=$2; shift ;;
+    --expect-members)     need_arg "$@"; EXPECT=$2; shift ;;
+    --lag-warn)           need_arg "$@"; LAG_WARN=$2; shift ;;
+    --lag-crit)           need_arg "$@"; LAG_CRIT=$2; shift ;;
+    --backup-max-age)     need_arg "$@"; BACKUP_MAX_AGE_H=$2; shift ;;
+    -c|--config)          need_arg "$@"; load_config "$2"; shift ;;
+    --json)               JSON=1 ;;
+    -q|--quiet)           QUIET=1 ;;
+    --no-color)           COLOR=0 ;;
+    -V|--version)         echo "ha-check $VERSION"; exit 0 ;;
+    -h|--help)            usage; exit 0 ;;
+    *) echo "unknown option: $1 (see --help)" >&2; exit 3 ;;
+  esac; shift
+done
+
+for t in curl jq; do command -v "$t" >/dev/null || die "$t is required"; done
+((${#PATRONI_URLS[@]})) || die "no Patroni API given (use --patroni http://HOST:8008)"
+for n in "$LAG_WARN" "$LAG_CRIT" "$BACKUP_MAX_AGE_H" "$EXPECT"; do
+  [[ "$n" =~ ^[0-9]+$ ]] || die "thresholds must be whole numbers (got '$n')"
+done
+
+# Health checks must never go through an HTTP proxy.
+CURL=(curl -s --noproxy '*' --max-time 3)
+((INSECURE)) && CURL+=(-k)
+P_CURL=("${CURL[@]}")
+[[ -n "$PATRONI_CACERT" ]] && P_CURL+=(--cacert "$PATRONI_CACERT")
+[[ -n "$PATRONI_AUTH" ]] && P_CURL+=(-u "$PATRONI_AUTH")
+E_CURL=("${CURL[@]}")
+[[ -n "$ETCD_CACERT" ]] && E_CURL+=(--cacert "$ETCD_CACERT")
+[[ -n "$ETCD_CERT" ]] && E_CURL+=(--cert "$ETCD_CERT")
+[[ -n "$ETCD_KEY" ]] && E_CURL+=(--key "$ETCD_KEY")
+
+# ------------------------------------------------------------------ reporting
+STATUS=0 RESULTS=()
+C_OK=$'\033[32m' C_WARN=$'\033[33m' C_CRIT=$'\033[31m' C_DIM=$'\033[2m' C_0=$'\033[0m'
+if [[ ! -t 1 ]] || ((JSON || !COLOR)); then C_OK="" C_WARN="" C_CRIT="" C_DIM="" C_0=""; fi
+
+result() { # result <OK|WARN|CRIT|INFO> <check> <message>
+  local lvl=$1 chk=$2 msg=$3 code=0 color=$C_OK
+  case $lvl in WARN) code=1 color=$C_WARN ;; CRIT) code=2 color=$C_CRIT ;; INFO) color=$C_DIM ;; esac
+  ((code > STATUS)) && STATUS=$code
+  RESULTS+=("$(jq -cn --arg l "$lvl" --arg c "$chk" --arg m "$msg" '{level:$l,check:$c,message:$m}')")
+  if ((JSON == 0)) && { ((QUIET == 0)) || ((code > 0)); }; then
+    printf '  %s%-4s%s  %-12s %s\n' "$color" "$lvl" "$C_0" "$chk" "$msg"
+  fi
+}
+section() { ((JSON || QUIET)) || printf '\n%s%s%s\n' "$C_DIM" "$1" "$C_0"; }
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+pjson() { "${P_CURL[@]}" "$1" 2>/dev/null | jq -e . 2>/dev/null; }
+
+# ------------------------------------------------------------------ discover
+CLUSTER_JSON="" CONFIG_JSON="" SCOPE="?"
+for u in "${PATRONI_URLS[@]}"; do
+  u=${u%/}
+  if c=$(pjson "$u/cluster") && [[ "$(jq -r 'has("members")' <<<"$c")" == true ]]; then
+    CLUSTER_JSON=$c
+    CONFIG_JSON=$(pjson "$u/config") || CONFIG_JSON="{}"
+    SCOPE=$(pjson "$u/patroni" | jq -r '.patroni.scope // "?"') || SCOPE="?"
+    break
+  fi
+done
+
+((JSON || QUIET)) || printf 'ha-check %s  cluster=%s  %s\n' "$VERSION" "$SCOPE" "$(date -Is)"
+
+# ------------------------------------------------------------------ 1. etcd
+section "etcd"
+if [[ -z "$ETCD_URLS" ]]; then
+  result INFO etcd "skipped (pass --etcd URL,URL,URL to check quorum)"
+else
+  IFS=', ' read -r -a EPS <<<"$ETCD_URLS"
+  ok=0 raft_leaders=()
+  for ep in "${EPS[@]}"; do
+    ep=${ep%/}
+    h=$("${E_CURL[@]}" "$ep/health" 2>/dev/null | jq -r '.health // empty' 2>/dev/null)
+    if [[ "$h" == "true" ]]; then
+      ok=$((ok + 1))
+      l=$("${E_CURL[@]}" -X POST "$ep/v3/maintenance/status" -d '{}' 2>/dev/null | jq -r '.leader // empty' 2>/dev/null)
+      [[ -n "$l" ]] && raft_leaders+=("$l")
+      result OK etcd "$ep healthy"
+    else
+      result WARN etcd "$ep unhealthy or unreachable"
+    fi
+  done
+  n=${#EPS[@]} quorum=$((${#EPS[@]} / 2 + 1))
+  if ((ok < quorum)); then
+    result CRIT etcd "only $ok/$n members healthy: quorum ($quorum) LOST, automatic failover is impossible"
+  elif ((ok < n)); then
+    result WARN etcd "$ok/$n healthy: quorum held, but one more failure stops failover"
+  fi
+  if ((${#raft_leaders[@]})) && (($(printf '%s\n' "${raft_leaders[@]}" | sort -u | wc -l) > 1)); then
+    result CRIT etcd "members disagree on the raft leader (possible network partition)"
+  fi
+fi
+
+# ------------------------------------------------------------------ 2. Patroni
+section "patroni"
+LEADER_HOST="" LEADER_PORT="" LTL=0
+if [[ -z "$CLUSTER_JSON" ]]; then
+  result CRIT patroni "no Patroni REST API reachable at: ${PATRONI_URLS[*]}"
+else
+  TTL=$(jq -r '.ttl // 30' <<<"$CONFIG_JSON")
+  members=$(jq '.members | length' <<<"$CLUSTER_JSON")
+  leaders=$(jq '[.members[] | select(.role=="leader" or .role=="standby_leader")] | length' <<<"$CLUSTER_JSON")
+  leader=$(jq -r '[.members[] | select(.role=="leader" or .role=="standby_leader")][0].name // "none"' <<<"$CLUSTER_JSON")
+  LTL=$(jq -r '[.members[] | select(.role=="leader" or .role=="standby_leader")][0].timeline // 0' <<<"$CLUSTER_JSON")
+  LEADER_HOST=$(jq -r '[.members[] | select(.role=="leader")][0].host // empty' <<<"$CLUSTER_JSON")
+  LEADER_PORT=$(jq -r '[.members[] | select(.role=="leader")][0].port // 5432' <<<"$CLUSTER_JSON")
+  expected=$((EXPECT > 0 ? EXPECT : members))
+  case $leaders in
+    1) result OK patroni "leader is $leader (timeline $LTL)" ;;
+    0) result CRIT patroni "NO LEADER: the cluster is not accepting writes" ;;
+    *) result CRIT patroni "$leaders leaders registered: investigate split-brain immediately" ;;
+  esac
+  if ((members < expected)); then result CRIT patroni "only $members of $expected members registered in the DCS"
+  else result OK patroni "$members/$expected members registered"; fi
+  ((EXPECT == 0)) && result INFO patroni "pass --expect-members N so a member that dies and drops out of the DCS is caught"
+  [[ "$(jq -r '.pause // false' <<<"$CLUSTER_JSON")" == "true" ]] &&
+    result WARN patroni "cluster is in MAINTENANCE MODE (paused): automatic failover is OFF (patronictl resume)"
+  [[ "$(jq -r '.failsafe_mode // false' <<<"$CONFIG_JSON")" != "true" ]] &&
+    result INFO patroni "failsafe_mode is off: a DCS outage will demote the leader"
+
+  now=$(date +%s)
+  while IFS=$'\t' read -r m api; do
+    [[ -z "$api" || "$api" == null ]] && { result WARN patroni "$m has no api_url registered"; continue; }
+    if st=$(pjson "$api"); then
+      [[ "$(jq -r '.pending_restart // false' <<<"$st")" == "true" ]] &&
+        result WARN patroni "$m needs a restart for a changed parameter (patronictl restart $SCOPE $m)"
+      seen=$(jq -r '.dcs_last_seen // empty' <<<"$st")
+      if [[ "$seen" =~ ^[0-9]+$ ]] && ((now - seen > TTL)); then
+        result WARN patroni "$m last reached the DCS $((now - seen))s ago (ttl ${TTL}s)"
+      fi
+    else
+      result CRIT patroni "$m REST API unreachable at $api"
+    fi
+  done < <(jq -r '.members[] | [.name, (.api_url // "")] | @tsv' <<<"$CLUSTER_JSON")
+
+  # ---------------------------------------------------------------- 3. Replication
+  section "replication"
+  while IFS=$'\t' read -r m role state tl lag; do
+    case $role in leader|standby_leader)
+      [[ "$state" == running ]] || result CRIT replication "leader $m is '$state'"
+      continue ;;
+    esac
+    if [[ "$state" != "streaming" ]]; then
+      result CRIT replication "$m is '$state' (expected streaming)"; continue
+    fi
+    [[ "$tl" != "$LTL" ]] && result WARN replication "$m on timeline $tl, leader on $LTL"
+    if [[ "$lag" =~ ^[0-9]+$ ]]; then
+      if ((lag >= LAG_CRIT)); then result CRIT replication "$m ($role) lag $(human "$lag")"
+      elif ((lag >= LAG_WARN)); then result WARN replication "$m ($role) lag $(human "$lag")"
+      else result OK replication "$m ($role) streaming, lag $(human "$lag")"; fi
+    else
+      result WARN replication "$m ($role) lag unknown"
+    fi
+  done < <(jq -r '.members[] | [.name, .role, (.state // "?"), (.timeline // 0 | tostring), (.lag // "unknown" | tostring)] | @tsv' <<<"$CLUSTER_JSON")
+  replicas=$(jq '[.members[] | select(.role!="leader" and .role!="standby_leader" and .state=="streaming")] | length' <<<"$CLUSTER_JSON")
+  ((replicas == 0)) && result CRIT replication "no streaming replica: losing $leader means downtime"
+  if [[ "$(jq -r '.synchronous_mode // false' <<<"$CONFIG_JSON")" == "true" ]]; then
+    sync=$(jq '[.members[] | select(.role=="sync_standby")] | length' <<<"$CLUSTER_JSON")
+    if ((sync == 0)); then result CRIT replication "synchronous_mode is on but there is no sync_standby"
+    else result OK replication "synchronous_mode on, $sync sync standby"; fi
+  fi
+fi
+
+# ------------------------------------------------------------------ 4-6. SQL checks
+section "routing & durability"
+export PGCONNECT_TIMEOUT=3
+q() { psql -w -h "$1" -p "$2" -U "$PG_USER" -d postgres -XAtqc "$3" 2>/dev/null; }
+# probe HOST PORT -> prints f|t, or AUTH (reachable but login failed), or DOWN
+probe() {
+  local out
+  if out=$(psql -w -h "$1" -p "$2" -U "$PG_USER" -d postgres -XAtqc "select pg_is_in_recovery()" 2>&1); then
+    echo "$out"
+  elif grep -qiE 'password|authentication|no pg_hba|role .* does not exist' <<<"$out"; then
+    echo AUTH
+  else
+    echo DOWN
+  fi
+}
+split() { local hp=$1; H=${hp%:*}; P=${hp##*:}; [[ "$H" == "$P" ]] && P=5432; }
+
+if ! command -v psql >/dev/null; then
+  result INFO routing "psql not installed: routing, archiving and slot checks skipped"
+else
+  SQL_H="" SQL_P=""
+  if [[ -n "$RW" ]]; then
+    split "$RW"
+    case $(probe "$H" "$P") in
+      f) result OK routing "RW $H:$P → primary"; SQL_H=$H SQL_P=$P ;;
+      t) result CRIT routing "RW $H:$P → a REPLICA (writes will fail)" ;;
+      AUTH) result WARN routing "RW $H:$P reachable, but login as $PG_USER failed (set up ~/.pgpass)" ;;
+      *) result CRIT routing "RW $H:$P not accepting connections" ;;
+    esac
+  fi
+  if [[ -n "$RO" ]]; then
+    split "$RO"
+    case $(probe "$H" "$P") in
+      t) result OK routing "RO $H:$P → replica" ;;
+      f) result WARN routing "RO $H:$P → primary (no healthy replica behind it?)" ;;
+      AUTH) result WARN routing "RO $H:$P reachable, but login as $PG_USER failed (set up ~/.pgpass)" ;;
+      *) result WARN routing "RO $H:$P not accepting connections" ;;
+    esac
+  fi
+  [[ -z "$RW$RO" ]] && result INFO routing "skipped (pass --rw HOST:PORT / --ro HOST:PORT)"
+  if [[ -z "$SQL_H" && -n "$LEADER_HOST" ]]; then SQL_H=$LEADER_HOST SQL_P=$LEADER_PORT; fi
+
+  if [[ -n "$SQL_H" ]]; then
+    arch=$(q "$SQL_H" "$SQL_P" "select coalesce(last_failed_time > coalesce(last_archived_time,'epoch'), false), coalesce(last_failed_wal,''), coalesce(extract(epoch from now()-last_archived_time)::int, -1), current_setting('archive_mode') from pg_stat_archiver")
+    if [[ -z "$arch" ]]; then
+      result WARN archiving "cannot query the primary at $SQL_H:$SQL_P as $PG_USER (check ~/.pgpass)"
+    else
+      IFS='|' read -r failing failed_wal since mode <<<"$arch"
+      if [[ "$mode" == "off" ]]; then
+        result WARN archiving "archive_mode is off: no point-in-time recovery possible"
+      elif [[ "$failing" == "t" ]]; then
+        result CRIT archiving "WAL archiving is FAILING (last failed: $failed_wal): backups and PITR are broken"
+      elif [[ "$since" == "-1" ]]; then
+        result WARN archiving "no WAL has been archived yet"
+      else
+        result OK archiving "last WAL archived ${since}s ago"
+      fi
+      slots=$(q "$SQL_H" "$SQL_P" "select slot_name||':'||coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint from pg_replication_slots where not active")
+      if [[ -n "$slots" ]]; then
+        while IFS=: read -r s bytes; do
+          if ((bytes > LAG_CRIT)); then result WARN slots "inactive slot '$s' is retaining $(human "$bytes") of WAL"
+          else result OK slots "slot '$s' inactive, retaining $(human "$bytes")"; fi
+        done <<<"$slots"
+      else
+        result OK slots "no inactive replication slots"
+      fi
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------------ 7. Backups
+section "backups"
+if [[ -z "$STANZA" ]]; then
+  result INFO backups "skipped (pass --stanza NAME for pgBackRest)"
+elif ! command -v pgbackrest >/dev/null; then
+  result WARN backups "pgbackrest not installed on this host"
+else
+  cfg=(); [[ -n "$PGBR_CONFIG" ]] && cfg=(--config="$PGBR_CONFIG")
+  as=(); [[ $EUID -eq 0 ]] && id postgres >/dev/null 2>&1 && as=(runuser -u postgres --)
+  info=$("${as[@]}" pgbackrest "${cfg[@]}" --stanza="$STANZA" --output=json info 2>/dev/null)
+  last=$(jq -r '.[0].backup[-1].timestamp.stop // empty' <<<"$info" 2>/dev/null)
+  if [[ -z "$last" ]]; then
+    result CRIT backups "no pgBackRest backup found for stanza '$STANZA'"
+  else
+    age_h=$((($(date +%s) - last) / 3600))
+    type=$(jq -r '.[0].backup[-1].type' <<<"$info")
+    if ((age_h > BACKUP_MAX_AGE_H)); then
+      result CRIT backups "newest backup ($type) is ${age_h}h old (limit ${BACKUP_MAX_AGE_H}h)"
+    else
+      result OK backups "newest backup: $type, ${age_h}h ago"
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------------ verdict
+LABELS=(OK WARNING CRITICAL UNKNOWN)
+if ((JSON)); then
+  printf '%s\n' "${RESULTS[@]}" | jq -s --arg c "$SCOPE" --arg s "${LABELS[$STATUS]}" --argjson code "$STATUS" --arg v "$VERSION" \
+    '{cluster:$c, status:$s, exit_code:$code, checked_at:(now|todate), version:$v, results:.}'
+else
+  case $STATUS in 0) col=$C_OK ;; 1) col=$C_WARN ;; *) col=$C_CRIT ;; esac
+  printf '\n%sOverall: %s%s\n' "$col" "${LABELS[$STATUS]}" "$C_0"
+fi
+exit "$STATUS"
