@@ -15,7 +15,8 @@
 #    --etcd-cert FILE        > TLS for etcd (mutual TLS)
 #    --etcd-key FILE        /
 #    --patroni-cacert FILE  CA for a Patroni REST API served over https
-#    --patroni-auth U:P     basic auth for the Patroni REST API
+#    --patroni-auth U:P     basic auth for the Patroni REST API (prefer PATRONI_AUTH=
+#                           in the config file: command-line arguments are visible in ps)
 #    --insecure             don't verify TLS certificates (not recommended)
 #    --rw HOST:PORT         read-write endpoint your apps use (HAProxy, VIP, pgbouncer...)
 #    --ro HOST:PORT         read-only endpoint
@@ -43,7 +44,7 @@
 #    0 OK   1 WARNING   2 CRITICAL   3 UNKNOWN
 # =============================================================================
 set -uo pipefail
-VERSION=1.0.0
+VERSION=1.0.1
 
 PATRONI_URLS=() ETCD_URLS=""
 ETCD_CACERT="" ETCD_CERT="" ETCD_KEY="" PATRONI_CACERT="" PATRONI_AUTH="" INSECURE=0
@@ -124,7 +125,15 @@ CURL=(curl -s --noproxy '*' --max-time 3)
 ((INSECURE)) && CURL+=(-k)
 P_CURL=("${CURL[@]}")
 [[ -n "$PATRONI_CACERT" ]] && P_CURL+=(--cacert "$PATRONI_CACERT")
-[[ -n "$PATRONI_AUTH" ]] && P_CURL+=(-u "$PATRONI_AUTH")
+if [[ -n "$PATRONI_AUTH" ]]; then
+  # Hand the credentials to curl in a private config file, never on its command
+  # line, where any local user could read them with ps.
+  AUTH_CFG=$(mktemp) || die "cannot create a temporary file"
+  trap 'rm -f "$AUTH_CFG"' EXIT
+  a=${PATRONI_AUTH//\\/\\\\}; a=${a//\"/\\\"}
+  printf 'user = "%s"\n' "$a" > "$AUTH_CFG"
+  P_CURL+=(-K "$AUTH_CFG")
+fi
 E_CURL=("${CURL[@]}")
 [[ -n "$ETCD_CACERT" ]] && E_CURL+=(--cacert "$ETCD_CACERT")
 [[ -n "$ETCD_CERT" ]] && E_CURL+=(--cert "$ETCD_CERT")

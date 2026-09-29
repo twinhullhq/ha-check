@@ -120,7 +120,7 @@ Give several `PATRONI` URLs: if the first member is down, the next one answers.
 | `--etcd URLS` | skipped | etcd client URLs, comma-separated |
 | `--etcd-cacert` `--etcd-cert` `--etcd-key` | | etcd mutual TLS |
 | `--patroni-cacert FILE` | | CA for a Patroni REST API on https |
-| `--patroni-auth USER:PASS` | | basic auth for the Patroni REST API |
+| `--patroni-auth USER:PASS` | | basic auth for the Patroni REST API. Prefer `PATRONI_AUTH=` in the config file: command-line arguments are visible in `ps` |
 | `--insecure` | | skip TLS verification (not recommended) |
 | `--rw HOST:PORT` / `--ro HOST:PORT` | skipped | endpoints your applications use |
 | `--pg-user USER` | `$PGUSER` or `postgres` | user for the SQL checks |

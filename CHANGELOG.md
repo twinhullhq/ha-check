@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 — 2026-09-29
+
+- Security: Patroni basic-auth credentials are now passed to curl in a private temporary
+  config file (removed on exit) instead of on curl's command line, where other local users
+  could read them with `ps`. The README now recommends `PATRONI_AUTH=` in the config file
+  over `--patroni-auth` on the command line for the same reason.
+
 ## 1.0.0 — 2026-09-28
 
 First public release.
