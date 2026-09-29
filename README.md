@@ -70,6 +70,8 @@ sudo chmod +x /usr/local/bin/ha-check
 ha-check --version
 ```
 
+Cloned the repository instead? Run `chmod +x ha-check` once (the executable bit isn't kept in the repo), or call it as `bash ha-check`.
+
 Needs `bash` 4+, `curl` and `jq`. `psql` enables the routing, archiving and slot checks;
 `pgbackrest` on the same host enables the backup check. One file, no daemon, nothing to compile.
 Run it from any machine that can reach the cluster: a node, a bastion, or your monitoring server.
