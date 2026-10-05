@@ -1,5 +1,7 @@
 # ha-check
 
+[![shellcheck](https://github.com/twinhullhq/ha-check/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/twinhullhq/ha-check/actions/workflows/shellcheck.yml)
+
 **Is your Patroni cluster really healthy? One command, one answer.**
 
 `patronictl list` tells you who the leader is. It doesn't tell you that etcd is one failure
